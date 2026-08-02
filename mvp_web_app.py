@@ -16,7 +16,6 @@ mvp_tax_judgment.py / mvp_purchase_docai.py 의 로직을 그대로 재사용해
 동안에만, 본인 브라우저에서만 보입니다. 다른 사람과 공유하려면 별도
 호스팅 서비스(Render, Railway 등)에 배포해야 합니다.
 """
-
 import html
 import os
 import urllib.parse
@@ -25,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from mvp_tax_judgment import judge_new_expense_data, df as TAX_CASES
 from mvp_purchase_docai import (
     RAW_DOCS, PO_REFERENCE_KRW, parse_document, review_flags, condition_adjusted_compare,
+    three_way_match, check_approval_limit,
 )
 
 # 클라우드 호스팅 서비스(Render, Railway 등)는 PORT 환경변수로 포트를 지정함 — 없으면 로컬 기본값 8000 사용
@@ -39,30 +39,31 @@ LGRAY = "#F2F2F2"
 
 STYLE = f"""
 <style>
-  body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; background:#fff; color:#262626;
-         max-width: 980px; margin: 0 auto; padding: 24px 20px 60px; }}
-  h1 {{ color:{NAVY}; font-size: 22px; margin-bottom:4px; }}
-  .sub {{ color:{GRAY}; font-size: 13px; margin-bottom: 28px; font-style: italic; }}
-  h2 {{ background:{NAVY}; color:#fff; padding:8px 14px; border-radius:6px; font-size:15px; margin:34px 0 14px; }}
-  .card {{ border:1px solid #e2e2e2; border-radius:8px; padding:16px 18px; margin-bottom:14px; background:#fafbfd; }}
-  .card.review {{ border-color:{RED}; background:#fdf3f1; }}
-  .card.ok {{ border-color:{GREEN}; background:#f2f8f2; }}
-  .tag {{ display:inline-block; font-size:11px; font-weight:bold; padding:2px 9px; border-radius:10px; margin-left:6px; }}
-  .tag.auto {{ background:{GOLD}; color:#fff; }}
-  .tag.review {{ background:{RED}; color:#fff; }}
-  table {{ border-collapse: collapse; width:100%; font-size:13px; margin-top:8px; }}
-  td, th {{ border:1px solid #e2e2e2; padding:6px 10px; text-align:left; }}
-  th {{ background:{LGRAY}; }}
-  form.inline {{ margin: 10px 0 18px; }}
-  input[type=text], textarea {{ width:100%; box-sizing:border-box; padding:8px 10px; font-size:14px;
-         border:1px solid #ccc; border-radius:6px; font-family:inherit; }}
-  textarea {{ height: 110px; }}
-  button {{ background:{NAVY}; color:#fff; border:none; padding:8px 18px; border-radius:6px;
-          font-size:13px; margin-top:8px; cursor:pointer; }}
-  .muted {{ color:{GRAY}; font-size:12px; }}
-  .field {{ font-size:13px; margin: 2px 0; }}
-  .field b {{ display:inline-block; width:76px; color:{GRAY}; }}
-  code {{ background:{LGRAY}; padding:1px 5px; border-radius:4px; }}
+body {{ font-family: -apple-system, "Malgun Gothic", sans-serif; background:#fff; color:#262626;
+       max-width: 980px; margin: 0 auto; padding: 24px 20px 60px; }}
+h1 {{ color:{NAVY}; font-size: 22px; margin-bottom:4px; }}
+.sub {{ color:{GRAY}; font-size: 13px; margin-bottom: 28px; font-style: italic; }}
+h2 {{ background:{NAVY}; color:#fff; padding:8px 14px; border-radius:6px; font-size:15px; margin:34px 0 14px; }}
+.card {{ border:1px solid #e2e2e2; border-radius:8px; padding:16px 18px; margin-bottom:14px; background:#fafbfd; }}
+.card.review {{ border-color:{RED}; background:#fdf3f1; }}
+.card.ok {{ border-color:{GREEN}; background:#f2f8f2; }}
+.tag {{ display:inline-block; font-size:11px; font-weight:bold; padding:2px 9px; border-radius:10px; margin-left:6px; }}
+.tag.auto {{ background:{GOLD}; color:#fff; }}
+.tag.review {{ background:{RED}; color:#fff; }}
+table {{ border-collapse: collapse; width:100%; font-size:13px; margin-top:8px; }}
+td, th {{ border:1px solid #e2e2e2; padding:6px 10px; text-align:left; }}
+th {{ background:{LGRAY}; }}
+form.inline {{ margin: 10px 0 18px; }}
+input[type=text], textarea {{ width:100%; box-sizing:border-box; padding:8px 10px; font-size:14px;
+       border:1px solid #ccc; border-radius:6px; font-family:inherit; }}
+textarea {{ height: 110px; }}
+button {{ background:{NAVY}; color:#fff; border:none; padding:8px 18px; border-radius:6px;
+       font-size:13px; margin-top:8px; cursor:pointer; }}
+.muted {{ color:{GRAY}; font-size:12px; }}
+.field {{ font-size:13px; margin: 2px 0; }}
+.field b {{ display:inline-block; width:76px; color:{GRAY}; }}
+.subcard {{ border-top:1px dashed #ddd; margin-top:10px; padding-top:8px; font-size:13px; }}
+code {{ background:{LGRAY}; padding:1px 5px; border-radius:4px; }}
 </style>
 """
 
@@ -104,6 +105,7 @@ def render_tax_section(query_text):
               <div class="field"><b>판단근거</b>{esc(s['판단근거'])}</div>
               <div class="muted">※ 담당자 최종 확인 후 반영 (자동 확정 아님)</div>
             </div>"""
+
         rows = "".join(
             f"<tr><td>{esc(c['id'])}</td><td>{c['similarity']:.2f}</td>"
             f"<td>{esc(c['계정과목'])}</td><td>{esc(c['지출내역'])}</td></tr>"
@@ -133,31 +135,73 @@ def render_tax_section(query_text):
     """
 
 
+def render_three_way_block(doc_name, extracted):
+    """[확장] 3-Way 대사 + 승인한도 검증 결과를 카드 안에 이어붙이는 서브블록."""
+    tw = three_way_match(doc_name, extracted)
+    appr = check_approval_limit(doc_name, extracted)
+
+    parts = []
+    if tw:
+        tag = "review" if tw["needs_review"] else "auto"
+        tag_label = "사람 검토 필요" if tw["needs_review"] else "3-Way 일치"
+        parts.append(f"""
+        <div class="subcard">
+          <b>3-Way 대사</b> <span class="tag {tag}">{tag_label}</span><br>
+          PO수량 {tw['po_qty']} / 인보이스수량 {tw['invoice_qty'] if tw['invoice_qty'] is not None else '—'} /
+          검수수량 {tw['received_qty']}<br>
+          <span class="muted">{esc(tw['overall'])}</span>
+        </div>""")
+
+    if appr:
+        if appr["exceeded"]:
+            parts.append(f"""
+            <div class="subcard">
+              <b>승인한도 검증</b> <span class="tag review">에스컬레이션 필요</span><br>
+              {appr['amount_krw']:,.0f}원 &gt; {esc(appr['approver'])} 전결한도 {appr['approval_limit_krw']:,.0f}원<br>
+              <span class="muted">→ 상위 승인자({esc(appr['escalate_to'])})에게 재상신 필요</span>
+            </div>""")
+        else:
+            parts.append(f"""
+            <div class="subcard">
+              <b>승인한도 검증</b> <span class="tag auto">승인 가능</span><br>
+              {appr['amount_krw']:,.0f}원 ≤ {esc(appr['approver'])} 전결한도 {appr['approval_limit_krw']:,.0f}원
+            </div>""")
+
+    return "".join(parts)
+
+
 def render_purchase_section(custom_raw):
     blocks = []
     for name, raw in RAW_DOCS.items():
         extracted = parse_document(raw)
         flags = review_flags(extracted)
         cmp = condition_adjusted_compare(name, extracted)
-        card_cls = "review" if flags else "ok"
+        tw = three_way_match(name, extracted)
+        card_cls = "review" if (flags or (tw and tw["needs_review"])) else "ok"
+
         field_rows = "".join(
             f"<div class='field'><b>{f}</b>{esc(extracted.get(f, '—'))}</div>"
             for f in ["거래처", "품목", "수량", "단가", "통화", "총액", "인도조건"]
         )
         flag_html = (f"<div><span class='tag review'>사람 검토 필요</span> 누락 필드: {esc(', '.join(flags))}</div>"
                      if flags else "<div><span class='tag auto'>필드 전량 자동 추출</span></div>")
+
         cmp_html = ""
         if cmp:
             status = "적정" if cmp["허용오차이내"] else "⚠ 오차 초과"
             cmp_html = (f"<div class='muted' style='margin-top:6px'>규칙기반 조건반영 비교: "
                         f"원화환산 {cmp['원화환산액']:,.0f}원 vs PO기준 {cmp['PO기준액']:,.0f}원 "
                         f"(차이 {cmp['차이율']*100:+.1f}%) → {status}</div>")
+
+        control_html = render_three_way_block(name, extracted)
+
         blocks.append(f"""
         <div class="card {card_cls}">
           <b>{esc(name)}</b>
           {field_rows}
           {flag_html}
           {cmp_html}
+          {control_html}
         </div>""")
 
     custom_html = ""
@@ -172,11 +216,13 @@ def render_purchase_section(custom_raw):
                      if flags else "<div><span class='tag auto'>필드 전량 자동 추출</span></div>")
         custom_html = f"""
         <h3 style="font-size:14px; margin-top:22px;">직접 입력한 문서 추출 결과</h3>
-        <div class="card {'review' if flags else 'ok'}">{field_rows}{flag_html}</div>
+        <div class="card {'review' if flags else 'ok'}">{field_rows}{flag_html}
+          <div class="muted" style="margin-top:6px;">※ 3-Way 대사·승인한도 검증은 사전 등록된 PO/검수 마스터가 있는 위 3개 데모 문서에서만 확인할 수 있습니다.</div>
+        </div>
         """
 
     return f"""
-    <h2>② 구매 다국어 서류 표준화 파일럿 + 조건반영 비교</h2>
+    <h2>② 구매 다국어 서류 표준화 + 3-Way 대사·승인한도 검증</h2>
     {''.join(blocks)}
     <details open><summary class="muted">직접 문서 텍스트를 입력해 테스트해보기 (Label: Value 형식)</summary>
       <form class="inline" method="get" action="/">
@@ -197,7 +243,7 @@ Total Amount: USD 500.00">{esc(custom_raw)}</textarea>
 PAGE_TEMPLATE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <title>AX Phase 1 MVP — 세무·구매</title>{style}</head><body>
 <h1>세무·구매 Phase 1 MVP 데모</h1>
-<div class="sub">전사 AX 제안서 — 세무 판단DB / 구매 문서AI 파일럿 로컬 프로토타입 (외부 API 미사용)</div>
+<div class="sub">전사 AX 제안서 — 세무 판단DB / 구매 문서AI·3-Way 대사·승인한도 검증 로컬 프로토타입 (외부 API 미사용)</div>
 {tax_section}
 {purchase_section}
 <p class="muted" style="margin-top:40px;">전사 AX 제안서(세무·구매 1단계) 참고용 개념검증(PoC) 데모입니다. 실제 사내 데이터가 아닌 시연용 샘플 데이터를 사용합니다.</p>
@@ -211,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+
         params = urllib.parse.parse_qs(parsed.query)
         query_text = params.get("new_expense", [""])[0]
         custom_doc = params.get("custom_doc", [""])[0]
