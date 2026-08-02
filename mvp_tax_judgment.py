@@ -150,7 +150,17 @@ class TinyTfidf:
 
 tfidf = TinyTfidf(df["지출내역"].tolist())
 
-CONFIDENCE_THRESHOLD = 0.30  # 이 값 미만이면 "신규/예외 → 전문가 검토"로 라우팅
+CONFIDENCE_THRESHOLD = 0.30    # 이 값 미만이면 "신규/예외 → 전문가 검토"로 라우팅
+AUTO_APPROVE_THRESHOLD = 0.85  # 이 값 이상이면 동일·거의 동일 거래로 보고 자동 확정(담당자 확인 생략)
+
+
+def review_tier(best_sim):
+    """유사도 기준 3단계 라우팅: expert_review / needs_confirmation / auto_approved"""
+    if best_sim < CONFIDENCE_THRESHOLD:
+        return "expert_review"
+    if best_sim >= AUTO_APPROVE_THRESHOLD:
+        return "auto_approved"
+    return "needs_confirmation"
 
 
 # ----------------------------------------------------------------
@@ -160,7 +170,9 @@ def judge_new_expense_data(new_text, top_k=3):
     """구조화된 결과(dict)를 반환 — CLI 출력과 웹 UI가 이 함수를 공유"""
     ranked = tfidf.most_similar(new_text, top_k=top_k)
     best_idx, best_sim = ranked[0]
-    routed_to_expert = best_sim < CONFIDENCE_THRESHOLD
+    tier = review_tier(best_sim)
+    routed_to_expert = tier == "expert_review"
+    auto_approved = tier == "auto_approved"
 
     similar_cases = [
         {
@@ -173,9 +185,12 @@ def judge_new_expense_data(new_text, top_k=3):
     result = {
         "query": new_text,
         "routed_to_expert": routed_to_expert,
+        "auto_approved": auto_approved,
+        "review_tier": tier,
         "best_similarity": best_sim,
         "similar_cases": similar_cases,
         "threshold": CONFIDENCE_THRESHOLD,
+        "auto_approve_threshold": AUTO_APPROVE_THRESHOLD,
     }
     if not routed_to_expert:
         best = df.iloc[best_idx]
@@ -198,6 +213,15 @@ def judge_new_expense(new_text, top_k=3):
     if result["routed_to_expert"]:
         print(f"판정: ⚠ 신규/예외 패턴 (최고 유사도 {result['best_similarity']:.2f} < "
               f"임계값 {CONFIDENCE_THRESHOLD}) → 전문가 검토로 라우팅")
+    elif result["auto_approved"]:
+        s = result["suggestion"]
+        print(f"판정: ✅✅ 동일·거의 동일 거래 → 자동 확정 (유사도 {result['best_similarity']:.2f} ≥ "
+              f"{AUTO_APPROVE_THRESHOLD}, 근거사례 {s['근거사례']})")
+        print(f"  - 추정 계정과목        : {s['계정과목']}")
+        print(f"  - 손금인정(법인세)     : {s['손금인정(법인세)']}")
+        print(f"  - 매입세액공제(부가세) : {s['매입세액공제(부가세)']}")
+        print(f"  - 판단근거(과거사례)   : {s['판단근거']}")
+        print(f"  - ※ 담당자 확인 없이 자동 확정 — 사후 샘플링 검토 대상으로 로그 기록")
     else:
         s = result["suggestion"]
         print(f"판정: ✅ 자동 처리안 제시 (유사도 {result['best_similarity']:.2f}, 근거사례 {s['근거사례']})")
@@ -210,7 +234,11 @@ def judge_new_expense(new_text, top_k=3):
     print(f"  참고 유사사례 Top-{top_k}:")
     for c in result["similar_cases"]:
         print(f"    · {c['id']} (유사도 {c['similarity']:.2f}) [{c['계정과목']}] {c['지출내역']}")
-    return {"routed_to_expert": result["routed_to_expert"], "similarity": result["best_similarity"]}
+    return {
+        "routed_to_expert": result["routed_to_expert"],
+        "auto_approved": result["auto_approved"],
+        "similarity": result["best_similarity"],
+    }
 
 
 # ----------------------------------------------------------------
@@ -260,7 +288,7 @@ def judge_new_expense_hybrid(new_text, amount=None, erp_category=None, cumulativ
 
     # 계정이 아직 확정되지 않았거나 비정형 증빙인 경우 → 사례기반 유사도 매칭으로 위임
     result = judge_new_expense_data(new_text, top_k=top_k)
-    result["route"] = "similarity_expert" if result["routed_to_expert"] else "similarity_auto"
+    result["route"] = f"similarity_{result['review_tier']}"
     result["similarity_used"] = True
     return result
 
@@ -281,6 +309,15 @@ def print_hybrid_result(new_text, **kwargs):
     elif r["routed_to_expert"]:
         print(f"판정: ⚠ 계정 미확정 + 신규/예외 패턴 (최고 유사도 {r['best_similarity']:.2f} < "
               f"임계값 {CONFIDENCE_THRESHOLD}) → 전문가 검토로 라우팅")
+    elif r["auto_approved"]:
+        s = r["suggestion"]
+        print(f"판정: ✅✅ 계정 미확정 + 동일·거의 동일 거래 → 자동 확정 (유사도 {r['best_similarity']:.2f} ≥ "
+              f"{AUTO_APPROVE_THRESHOLD}, 근거사례 {s['근거사례']})")
+        print(f"  - 추정 계정과목        : {s['계정과목']}")
+        print(f"  - 손금인정(법인세)     : {s['손금인정(법인세)']}")
+        print(f"  - 매입세액공제(부가세) : {s['매입세액공제(부가세)']}")
+        print(f"  - 판단근거(과거사례)   : {s['판단근거']}")
+        print(f"  - ※ 담당자 확인 없이 자동 확정 — 사후 샘플링 검토 대상으로 로그 기록")
     else:
         s = r["suggestion"]
         print(f"판정: ✅ 계정 미확정 → 사례기반 자동 처리안 제시 (유사도 {r['best_similarity']:.2f}, 근거사례 {s['근거사례']})")
@@ -292,6 +329,20 @@ def print_hybrid_result(new_text, **kwargs):
 
 
 # ----------------------------------------------------------------
+# 3-c) 사후 샘플링 검토 — 자동 확정 건도 책임소재를 남기기 위한 통제
+# ----------------------------------------------------------------
+def audit_sample(auto_approved_ids, sample_rate=0.1, seed=None):
+    """자동 확정된 건 중 일부를 무작위 추출해 담당자 사후 재검토 대상으로 지정.
+    IT팀이 지적한 '책임소재·검토주체 불명확' 리스크에 대한 보완 통제."""
+    import random
+    if not auto_approved_ids:
+        return []
+    rng = random.Random(seed)
+    k = max(1, round(len(auto_approved_ids) * sample_rate))
+    return sorted(rng.sample(auto_approved_ids, k))
+
+
+# ----------------------------------------------------------------
 # 4) 데모 실행
 # ----------------------------------------------------------------
 if __name__ == "__main__":
@@ -299,21 +350,28 @@ if __name__ == "__main__":
     print(f"과거 사례 {len(df)}건 로드 완료\n")
 
     demo_queries = [
-        "거래처 부장님과 저녁 접대 자리 비용",          # C001/C002/C009와 유사 → 자동 처리안
+        "거래처 임원과 저녁 식사 접대비 지출",           # C001과 완전 동일 문구 → 자동 확정
+        "거래처 부장님과 저녁 접대 자리 비용",          # C001/C002/C009와 유사 → AI 처리안 제시(담당자 확인)
         "부서 워크숍 저녁 회식비",                       # 애매 - 회의비/접대비 경계 케이스
-        "해외 바이어 출장 항공권 구매",                  # C004와 유사 → 자동 처리안
+        "해외 바이어 출장 항공권 구매",                  # C004와 유사 → AI 처리안 제시(담당자 확인)
         "신규 직원 재택근무용 모니터 구매",              # 과거 사례와 유사도 낮음 → 신규/예외
     ]
     results = [judge_new_expense(q) for q in demo_queries]
 
-    n_auto = sum(1 for r in results if not r["routed_to_expert"])
+    n_auto_approved = sum(1 for r in results if r["auto_approved"])
+    n_needs_confirm = sum(1 for r in results if not r["routed_to_expert"] and not r["auto_approved"])
+    n_expert = sum(1 for r in results if r["routed_to_expert"])
     print(f"\n{'='*78}")
-    print(f"요약: {len(results)}건 중 {n_auto}건 자동 처리안 제시, "
-          f"{len(results)-n_auto}건 전문가 검토 라우팅")
-    print("(실제 도입 시: 과거 사례 수가 늘어날수록 자동 처리안 비율이 상승하는 구조)")
+    print(f"요약: {len(results)}건 중 {n_auto_approved}건 자동 확정(동일·고유사도), "
+          f"{n_needs_confirm}건 AI 처리안 제시(담당자 확인 필요), {n_expert}건 전문가 검토 라우팅")
+    print("(실제 도입 시: 과거 사례 수가 늘어날수록 자동 확정 비율이 상승하는 구조)")
+
+    auto_ids = [q for q, r in zip(demo_queries, results) if r["auto_approved"]]
+    sampled = audit_sample(auto_ids, sample_rate=0.5, seed=1)
+    print(f"사후 샘플링 검토 대상(자동 확정 건 중 50% 무작위 추출): {sampled or '해당 없음'}")
 
     print("\n" + "#" * 78)
-    print("# 2단 구조 데모: 1단(규칙기반 한도 스크리닝) + 2단(사례기반 유사도 매칭)")
+    print("# 2단 구조 데모: 1단(규칙기반 한도 스크리닝) + 2단(사례기반 유사도 매칭, 3단계 라우팅)")
     print("#" * 78)
 
     # 1단 — ERP상 계정이 이미 "접대비"로 확정된 건: 유사도 매칭 없이 한도 규칙만으로 즉시 판정
@@ -322,6 +380,7 @@ if __name__ == "__main__":
     print_hybrid_result("협력사 담당자 점심 식사 접대", amount=800_000,
                          erp_category="접대비", cumulative_entertainment_used=2_000_000)   # 한도 내
 
-    # 2단 — 계정이 아직 미확정인 건: 기존 사례기반 유사도 매칭으로 위임
+    # 2단 — 계정이 아직 미확정인 건: 기존 사례기반 유사도 매칭으로 위임 (동일 문구 → 자동 확정 데모)
+    print_hybrid_result("거래처 임원과 저녁 식사 접대비 지출")
     print_hybrid_result("부서 워크숍 저녁 회식비")
     print_hybrid_result("신규 직원 재택근무용 모니터 구매")
