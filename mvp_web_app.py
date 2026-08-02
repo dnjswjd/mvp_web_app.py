@@ -189,7 +189,7 @@ PAGE_TEMPLATE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <div class="sub">전사 AX 제안서 — 세무 판단DB / 구매 문서AI 파일럿 로컬 프로토타입 (외부 API 미사용)</div>
 {tax_section}
 {purchase_section}
-<p class="muted" style="margin-top:40px;">이 서버는 본인 컴퓨터에서만 접근 가능한 로컬 서버입니다. 종료하려면 터미널에서 Ctrl+C를 누르세요.</p>
+<p class="muted" style="margin-top:40px;">전사 AX 제안서(세무·구매 1단계) 참고용 개념검증(PoC) 데모입니다. 실제 사내 데이터가 아닌 시연용 샘플 데이터를 사용합니다.</p>
 </body></html>"""
 
 
