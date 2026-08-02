@@ -1,10 +1,14 @@
 """
 MVP: 세무 판단이력 DB + 사례기반 자동매칭 (Phase 1 - 세무팀)
 ----------------------------------------------------------------
-컨셉: 과거 세무처리 사례를 축적해두고, 새로운 비용전표가 들어오면
-      문자 n-gram TF-IDF 유사도로 가장 비슷한 과거 사례를 찾아
-      처리안을 자동 제시한다. 유사도가 낮으면(=신규/예외 패턴)
-      자동 제시하지 않고 "전문가 검토 필요"로 라우팅한다.
+컨셉: 2단 구조로 처리한다.
+  1단(규칙기반 선별): ERP 정형데이터상 계정이 이미 "접대비"로 확정된
+      전표는 한도(누적 사용액) 규칙으로 즉시 스크리닝한다 — 명백한
+      한도초과/한도내 여부는 유사도 매칭 없이 규칙만으로 판정한다.
+  2단(사례기반 매칭): 계정이 아직 미확정이거나 비정형인 나머지 건은
+      과거 세무처리 사례를 문자 n-gram TF-IDF 유사도로 검색해 가장
+      비슷한 사례의 처리안을 자동 제시한다. 유사도가 낮으면(=신규/
+      예외 패턴) 자동 제시하지 않고 "전문가 검토 필요"로 라우팅한다.
 
 외부 라이브러리(scikit-learn 등) 없이 표준 라이브러리만으로 구현한
 경량 MVP입니다. 실제 구축 시에는 ERP 전표·증빙 데이터와 연동하고,
@@ -210,6 +214,84 @@ def judge_new_expense(new_text, top_k=3):
 
 
 # ----------------------------------------------------------------
+# 3-b) 1단: 규칙기반 한도 스크리닝 (ERP상 계정이 "접대비"로 이미 확정된 건)
+# ----------------------------------------------------------------
+ENTERTAINMENT_ANNUAL_LIMIT = 36_000_000  # 데모용 단순화 값(실제는 매출액 등에 따른 법정 공식 적용)
+
+
+def check_entertainment_limit(amount, cumulative_used, limit=ENTERTAINMENT_ANNUAL_LIMIT):
+    new_total = cumulative_used + amount
+    return {
+        "exceeded": new_total > limit,
+        "cumulative_used_before": cumulative_used,
+        "cumulative_used_after": new_total,
+        "limit": limit,
+    }
+
+
+def judge_new_expense_hybrid(new_text, amount=None, erp_category=None, cumulative_entertainment_used=0, top_k=3):
+    """
+    2단 판단 진입점.
+    - erp_category == "접대비" 이고 amount가 주어지면: 유사도 매칭 없이
+      규칙기반 한도 스크리닝만으로 즉시 판정(명백한 위반/한도내 모두 자동).
+    - 그 외(계정 미확정·비정형 건): 기존 사례기반 유사도 매칭(judge_new_expense_data)으로 위임.
+    """
+    if erp_category == "접대비" and amount is not None:
+        chk = check_entertainment_limit(amount, cumulative_entertainment_used)
+        base = {
+            "route": "rule_violation" if chk["exceeded"] else "rule_ok",
+            "routed_to_expert": False,
+            "similarity_used": False,
+            "계정과목": "접대비",
+            "매입세액공제(부가세)": "공제 불가 (접대비 관련 매입세액)",
+            "limit_check": chk,
+        }
+        if chk["exceeded"]:
+            base["손금인정(법인세)"] = (
+                f"한도 초과분 손금불산입 (한도 {chk['limit']:,}원, 한도초과 후 누적 {chk['cumulative_used_after']:,}원)"
+            )
+            base["판단근거"] = "ERP 정형데이터 규칙기반 한도 스크리닝 결과 — 명백한 한도초과 위반"
+        else:
+            base["손금인정(법인세)"] = (
+                f"한도 내 손금 인정 (한도 {chk['limit']:,}원, 사용 후 누적 {chk['cumulative_used_after']:,}원)"
+            )
+            base["판단근거"] = "ERP 정형데이터 규칙기반 한도 스크리닝 결과 — 한도 내"
+        return base
+
+    # 계정이 아직 확정되지 않았거나 비정형 증빙인 경우 → 사례기반 유사도 매칭으로 위임
+    result = judge_new_expense_data(new_text, top_k=top_k)
+    result["route"] = "similarity_expert" if result["routed_to_expert"] else "similarity_auto"
+    result["similarity_used"] = True
+    return result
+
+
+def print_hybrid_result(new_text, **kwargs):
+    r = judge_new_expense_hybrid(new_text, **kwargs)
+    print(f"\n{'='*78}")
+    print(f"[신규 비용전표] {new_text}  (ERP 계정: {kwargs.get('erp_category') or '미확정'})")
+    print(f"{'-'*78}")
+    if not r["similarity_used"]:
+        chk = r["limit_check"]
+        tag = "⚠ 규칙기반 자동판정(한도초과)" if r["route"] == "rule_violation" else "✅ 규칙기반 자동판정(한도내)"
+        print(f"판정: {tag} — 유사도 매칭 미사용")
+        print(f"  - 한도 대비 누적사용액: {chk['cumulative_used_after']:,}원 / {chk['limit']:,}원")
+        print(f"  - 손금인정(법인세)     : {r['손금인정(법인세)']}")
+        print(f"  - 매입세액공제(부가세) : {r['매입세액공제(부가세)']}")
+        print(f"  - 판단근거             : {r['판단근거']}")
+    elif r["routed_to_expert"]:
+        print(f"판정: ⚠ 계정 미확정 + 신규/예외 패턴 (최고 유사도 {r['best_similarity']:.2f} < "
+              f"임계값 {CONFIDENCE_THRESHOLD}) → 전문가 검토로 라우팅")
+    else:
+        s = r["suggestion"]
+        print(f"판정: ✅ 계정 미확정 → 사례기반 자동 처리안 제시 (유사도 {r['best_similarity']:.2f}, 근거사례 {s['근거사례']})")
+        print(f"  - 추정 계정과목        : {s['계정과목']}")
+        print(f"  - 손금인정(법인세)     : {s['손금인정(법인세)']}")
+        print(f"  - 매입세액공제(부가세) : {s['매입세액공제(부가세)']}")
+        print(f"  - 판단근거(과거사례)   : {s['판단근거']}")
+    return r
+
+
+# ----------------------------------------------------------------
 # 4) 데모 실행
 # ----------------------------------------------------------------
 if __name__ == "__main__":
@@ -229,3 +311,17 @@ if __name__ == "__main__":
     print(f"요약: {len(results)}건 중 {n_auto}건 자동 처리안 제시, "
           f"{len(results)-n_auto}건 전문가 검토 라우팅")
     print("(실제 도입 시: 과거 사례 수가 늘어날수록 자동 처리안 비율이 상승하는 구조)")
+
+    print("\n" + "#" * 78)
+    print("# 2단 구조 데모: 1단(규칙기반 한도 스크리닝) + 2단(사례기반 유사도 매칭)")
+    print("#" * 78)
+
+    # 1단 — ERP상 계정이 이미 "접대비"로 확정된 건: 유사도 매칭 없이 한도 규칙만으로 즉시 판정
+    print_hybrid_result("거래처 대표이사 초청 고급 한정식 접대", amount=5_000_000,
+                         erp_category="접대비", cumulative_entertainment_used=32_000_000)  # 한도(3,600만) 초과
+    print_hybrid_result("협력사 담당자 점심 식사 접대", amount=800_000,
+                         erp_category="접대비", cumulative_entertainment_used=2_000_000)   # 한도 내
+
+    # 2단 — 계정이 아직 미확정인 건: 기존 사례기반 유사도 매칭으로 위임
+    print_hybrid_result("부서 워크숍 저녁 회식비")
+    print_hybrid_result("신규 직원 재택근무용 모니터 구매")
