@@ -82,6 +82,17 @@ def render_tax_section(query_text):
               최고 유사도 {r['best_similarity']:.2f} (임계값 {r['threshold']} 미만) — 과거 사례와 충분히 유사하지 않아
               자동 처리안을 제시하지 않습니다.
             </div>"""
+        elif r["auto_approved"]:
+            s = r["suggestion"]
+            result_html = f"""
+            <div class="card ok">
+              <b>✅✅ 동일·거의 동일 거래 → 자동 확정</b> <span class="tag auto">유사도 {r['best_similarity']:.2f} ≥ {r['auto_approve_threshold']} · 근거 {esc(s['근거사례'])}</span>
+              <div class="field"><b>계정과목</b>{esc(s['계정과목'])}</div>
+              <div class="field"><b>법인세</b>{esc(s['손금인정(법인세)'])}</div>
+              <div class="field"><b>부가세</b>{esc(s['매입세액공제(부가세)'])}</div>
+              <div class="field"><b>판단근거</b>{esc(s['판단근거'])}</div>
+              <div class="muted">※ 담당자 확인 없이 자동 확정 — 사후 샘플링 검토 대상으로 로그 기록</div>
+            </div>"""
         else:
             s = r["suggestion"]
             result_html = f"""
